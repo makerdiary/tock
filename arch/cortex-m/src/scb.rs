@@ -54,3 +54,8 @@ pub unsafe fn reset() {
     let reset = (0x5FA << 16) | (aircr & (0x7 << 8)) | (1 << 2);
     SCB.aircr.set(reset);
 }
+
+/// relocate interrupt vector table
+pub unsafe fn set_vector_table_offset(offset: u32) {
+    SCB.vtor.set(offset);
+}
