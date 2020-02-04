@@ -70,6 +70,15 @@ impl UartPins {
     }
 }
 
+pub enum UartChannel<'a> {
+    Pins(UartPins),
+    Rtt(
+        &'a mut [u8],
+        &'a mut [u8],
+        &'a mut capsules::segger_rtt::SeggerRttMemory<'a>,
+    ),
+}
+
 /// Supported drivers by the platform
 pub struct Platform {
     ble_radio: &'static capsules::ble_advertising_driver::BLE<
@@ -93,9 +102,17 @@ pub struct Platform {
         'static,
         capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc<'static>>,
     >,
+    usb: Option<
+        &'static capsules::usb::usb_ctap::CtapUsbSyscallDriver<
+            'static,
+            'static,
+            nrf52::usbd::Usbd<'static>,
+        >,
+    >,
     // The nRF52dk does not have the flash chip on it, so we make this optional.
     nonvolatile_storage:
         Option<&'static capsules::nonvolatile_storage_driver::NonvolatileStorage<'static>>,
+    nvmc: &'static nrf52::nvmc::SyscallDriver,
 }
 
 impl kernel::Platform for Platform {
@@ -119,6 +136,10 @@ impl kernel::Platform for Platform {
             capsules::nonvolatile_storage_driver::DRIVER_NUM => {
                 f(self.nonvolatile_storage.map_or(None, |nv| Some(nv)))
             }
+            nrf52::nvmc::DRIVER_NUM => f(Some(self.nvmc)),
+            capsules::usb::usb_ctap::DRIVER_NUM => {
+                f(self.usb.map(|ctap| ctap as &dyn kernel::Driver))
+            }
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
@@ -136,7 +157,7 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
     debug_pin2_index: Pin,
     debug_pin3_index: Pin,
     led: &'static capsules::led::LED<'static>,
-    uart_pins: &UartPins,
+    uart_channel: UartChannel<'static>,
     spi_pins: &SpiPins,
     mx25r6435f: &Option<SpiMX25R6435FPins>,
     button: &'static capsules::button::Button<'static>,
@@ -146,6 +167,7 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
     app_fault_response: kernel::procs::FaultResponse,
     reg_vout: Regulator0Output,
     nfc_as_gpios: bool,
+    usb: &Option<&'static nrf52::usbd::Usbd<'static>>,
     chip: &'static nrf52::chip::NRF52<I>,
 ) {
     // Make non-volatile memory writable and activate the reset button
@@ -232,6 +254,38 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
     let alarm = components::alarm::AlarmDriverComponent::new(board_kernel, mux_alarm)
         .finalize(components::alarm_component_helper!(nrf52::rtc::Rtc));
 
+    let channel: &dyn kernel::hil::uart::Uart = match uart_channel {
+        UartChannel::Pins(uart_pins) => {
+            nrf52::uart::UARTE0.initialize(
+                nrf52::pinmux::Pinmux::new(uart_pins.txd as u32),
+                nrf52::pinmux::Pinmux::new(uart_pins.rxd as u32),
+                Some(nrf52::pinmux::Pinmux::new(uart_pins.cts as u32)),
+                Some(nrf52::pinmux::Pinmux::new(uart_pins.rts as u32)),
+            );
+            &nrf52::uart::UARTE0
+        }
+        UartChannel::Rtt(up_buffer, down_buffer, rtt_memory) => {
+            // Virtual alarm for the Segger RTT communication channel
+            let virtual_alarm_rtt = static_init!(
+                capsules::virtual_alarm::VirtualMuxAlarm<'static, nrf52::rtc::Rtc>,
+                capsules::virtual_alarm::VirtualMuxAlarm::new(mux_alarm)
+            );
+
+            // RTT communication channel
+            let rtt = static_init!(
+                capsules::segger_rtt::SeggerRtt<VirtualMuxAlarm<'static, nrf52::rtc::Rtc>>,
+                capsules::segger_rtt::SeggerRtt::new(
+                    virtual_alarm_rtt,
+                    rtt_memory,
+                    up_buffer,
+                    down_buffer
+                )
+            );
+            hil::time::Alarm::set_client(virtual_alarm_rtt, rtt);
+            rtt
+        }
+    };
+
     let dynamic_deferred_call_clients =
         static_init!([DynamicDeferredCallClientState; 2], Default::default());
     let dynamic_deferred_caller = static_init!(
@@ -241,19 +295,10 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
     DynamicDeferredCall::set_global_instance(dynamic_deferred_caller);
 
     // Create a shared UART channel for the console and for kernel debug.
-    let uart_mux = components::console::UartMuxComponent::new(
-        &nrf52::uart::UARTE0,
-        115200,
-        dynamic_deferred_caller,
-    )
-    .finalize(());
+    let uart_mux =
+        components::console::UartMuxComponent::new(channel, 115200, dynamic_deferred_caller)
+            .finalize(());
 
-    nrf52::uart::UARTE0.initialize(
-        nrf52::pinmux::Pinmux::new(uart_pins.txd as u32),
-        nrf52::pinmux::Pinmux::new(uart_pins.rxd as u32),
-        Some(nrf52::pinmux::Pinmux::new(uart_pins.cts as u32)),
-        Some(nrf52::pinmux::Pinmux::new(uart_pins.rts as u32)),
-    );
     let pconsole =
         components::process_console::ProcessConsoleComponent::new(board_kernel, uart_mux)
             .finalize(());
@@ -376,6 +421,52 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
         None
     };
 
+    let nvmc = static_init!(
+        nrf52::nvmc::SyscallDriver,
+        nrf52::nvmc::SyscallDriver::new(
+            &nrf52::nvmc::NVMC,
+            board_kernel.create_grant(&memory_allocation_capability)
+        )
+    );
+
+    // Configure USB controller if supported
+    let usb_driver: Option<
+        &'static capsules::usb::usb_ctap::CtapUsbSyscallDriver<
+            'static,
+            'static,
+            nrf52::usbd::Usbd<'static>,
+        >,
+    > = usb.map(|driver| {
+        let usb_ctap = static_init!(
+            capsules::usb::usbc_ctap_hid::ClientCtapHID<
+                'static,
+                'static,
+                nrf52::usbd::Usbd<'static>,
+            >,
+            capsules::usb::usbc_ctap_hid::ClientCtapHID::new(driver)
+        );
+        driver.set_client(usb_ctap);
+
+        // Enable power events to be sent to USB controller
+        nrf52::power::POWER.set_usb_client(driver);
+        nrf52::power::POWER.enable_interrupts();
+
+        // Configure the USB userspace driver
+        let usb_driver = static_init!(
+            capsules::usb::usb_ctap::CtapUsbSyscallDriver<
+                'static,
+                'static,
+                nrf52::usbd::Usbd<'static>,
+            >,
+            capsules::usb::usb_ctap::CtapUsbSyscallDriver::new(
+                usb_ctap,
+                board_kernel.create_grant(&memory_allocation_capability)
+            )
+        );
+        usb_ctap.set_client(usb_driver);
+        usb_driver as &'static _
+    });
+
     // Start all of the clocks. Low power operation will require a better
     // approach than this.
     nrf52::clock::CLOCK.low_stop();
@@ -407,8 +498,10 @@ pub unsafe fn setup_board<I: nrf52::interrupt_service::InterruptService>(
         rng: rng,
         temp: temp,
         alarm: alarm,
+        usb: usb_driver,
         nonvolatile_storage: nonvolatile_storage,
         ipc: kernel::ipc::IPC::new(board_kernel, &memory_allocation_capability),
+        nvmc: nvmc,
     };
 
     platform.pconsole.start();

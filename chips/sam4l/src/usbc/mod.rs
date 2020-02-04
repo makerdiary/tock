@@ -1547,6 +1547,10 @@ impl hil::usb::UsbController<'a> for Usbc<'a> {
         requests.resume_out = true;
         self.requests[endpoint].set(requests);
     }
+
+    fn endpoint_cancel_in(&self, _endpoint: usize) {
+        unimplemented!()
+    }
 }
 
 /// Static state to manage the USBC
